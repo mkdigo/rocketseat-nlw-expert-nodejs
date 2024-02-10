@@ -1,13 +1,52 @@
 import { randomUUID } from 'node:crypto';
-import { FastifyInstance } from 'fastify';
+import { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/prisma';
 import { redis } from '../../lib/redis';
 import { voting } from '../../utils/votting-pub-sub';
+import { PollRepositoryInterface } from '../../repositories/poll-repository-interface';
+import { PollResource } from '../../resources/poll-resource';
 
-export async function voteOnPoll(app: FastifyInstance) {
-  app.post('/polls/:pollId/votes', async (request, reply) => {
+export class PollController {
+  constructor(private repository: PollRepositoryInterface) {}
+
+  async find(request: FastifyRequest, reply: FastifyReply) {
+    const getPollParams = z.object({
+      pollId: z.string().uuid(),
+    });
+
+    const { pollId } = getPollParams.parse(request.params);
+
+    const poll = await this.repository.find(pollId);
+
+    if (!poll) return reply.status(400).send({ message: 'Poll not found.' });
+
+    const votes = await this.repository.votes(pollId);
+
+    const pollResource = new PollResource(poll);
+
+    return reply.send({
+      poll: pollResource.resource(votes),
+    });
+  }
+
+  async create(request: FastifyRequest, reply: FastifyReply) {
+    const createPollBody = z.object({
+      title: z.string(),
+      options: z.array(z.string()),
+    });
+
+    const { title, options } = createPollBody.parse(request.body);
+
+    const poll = await this.repository.create({ title, options });
+
+    return reply.status(201).send({
+      pollId: poll.id,
+    });
+  }
+
+  async vote(request: FastifyRequest, reply: FastifyReply) {
     const voteOnPollBody = z.object({
       pollOptionId: z.string().uuid(),
     });
@@ -22,13 +61,9 @@ export async function voteOnPoll(app: FastifyInstance) {
     let { sessionId } = request.cookies;
 
     if (sessionId) {
-      const userPreviousVoteOnPoll = await prisma.vote.findUnique({
-        where: {
-          sessionId_pollId: {
-            sessionId,
-            pollId,
-          },
-        },
+      const userPreviousVoteOnPoll = await this.repository.findVote({
+        sessionId,
+        pollId,
       });
 
       if (
@@ -36,11 +71,8 @@ export async function voteOnPoll(app: FastifyInstance) {
         userPreviousVoteOnPoll.pollOptionId !== pollOptionId
       ) {
         // remove previous vote
-        await prisma.vote.delete({
-          where: {
-            id: userPreviousVoteOnPoll.id,
-          },
-        });
+        await this.repository.deleteVote(userPreviousVoteOnPoll.id);
+
         const votes = await redis.zincrby(
           pollId,
           -1,
@@ -69,13 +101,7 @@ export async function voteOnPoll(app: FastifyInstance) {
       });
     }
 
-    await prisma.vote.create({
-      data: {
-        sessionId,
-        pollId,
-        pollOptionId,
-      },
-    });
+    await this.repository.createVote({ sessionId, pollId, pollOptionId });
 
     const votes = await redis.zincrby(pollId, 1, pollOptionId);
 
@@ -85,5 +111,5 @@ export async function voteOnPoll(app: FastifyInstance) {
     });
 
     return reply.status(201).send();
-  });
+  }
 }
